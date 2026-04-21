@@ -8,9 +8,10 @@ wheels/
 
 # Virtual environments
 .venv
+.env
 
 # API extraction run data (payloads, dumps, auth)
-api-extraction/data/
-api-extraction/*/data/
+*/data/
 
 UI-extraction/data/ 
+payload_response_format/

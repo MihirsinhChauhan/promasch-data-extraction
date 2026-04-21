@@ -10,6 +10,9 @@ Saves:
 
 Usage:
   uv run python collector.py --user USER --password PASS [--headful] [--wait 60]
+  uv run python collector.py ... --snapshot-ui [--snapshot-ui-manual] [--snapshot-ui-only]
+  # Optional: indent_selectors.json in output-dir with "purchase" / "completed" keys
+  # Debug: INDENT_HTTP_AUDIT=1 writes logs/http_audit.log and sample_erp_post.txt
 """
 
 from __future__ import annotations
@@ -20,9 +23,24 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Frame, Locator, Page, sync_playwright
+
+from ui_probe import (
+    COMPLETED_FALLBACK_SELECTORS,
+    PURCHASE_NAV_SELECTORS,
+    all_probe_selectors,
+    get_indent_ui_context,
+    gwt_soft_wait_after_action,
+    load_indent_selectors_config,
+    merge_completed_selectors,
+    merge_purchase_selectors,
+    owning_page,
+    save_selector_snapshot,
+    first_match,
+    wait_for_post_login_shell,
+)
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
@@ -143,7 +161,12 @@ def parse_gwt_headers_from_payload(post_data: str) -> Dict[str, str]:
 
 def detect_erp_url(post_data: str, request_url: str) -> str:
     """Determine which ERP endpoint a payload targets."""
-    if "/erp2" in request_url or "ERPService2" in post_data or _DETAIL_METHOD in post_data:
+    pl = post_data.lower()
+    if (
+        "/erp2" in request_url
+        or "erpservice2" in pl
+        or _DETAIL_METHOD.lower() in pl
+    ):
         return DEFAULT_ERP2_URL
     return DEFAULT_ERP_URL
 
@@ -164,15 +187,8 @@ def login_and_wait(page: Page, base_url: str, user: str, password: str) -> None:
 
 
 # ── Navigation ────────────────────────────────────────────────────────────────
-
-# Sidebar link: "Purchase | Work Order | Challans | Vendor Bills" (under Stock)
-_PURCHASE_SIDEBAR_SELECTORS = [
-    "a:has-text('Purchase | Work Order')",
-    "text=Purchase | Work Order | Challans | Vendor Bills",
-    "a:has-text('Purchase')",
-    "div:has-text('Purchase | Work Order | Challans | Vendor Bills')",
-    "span:has-text('Purchase | Work Order | Challans | Vendor Bills')",
-]
+# Default Purchase / COMPLETED fallback lists live in ui_probe.PURCHASE_NAV_SELECTORS
+# and ui_probe.COMPLETED_FALLBACK_SELECTORS (override via indent_selectors.json).
 
 # JS to find the INDENTS section heading and click COMPLETED within it.
 # Walks the DOM to find an element whose own text is "INDENTS", then searches
@@ -261,7 +277,11 @@ _INDENT_COMPLETED_JS = """
 """
 
 
-def navigate_to_indent_completed(page: Page) -> bool:
+def navigate_to_indent_completed(
+    ctx: Union[Page, Frame],
+    purchase_selectors: List[str],
+    completed_fallback_selectors: List[str],
+) -> bool:
     """Navigate to Indent Completed via the sidebar Purchase section.
 
     Step 1 – click "Purchase | Work Order | Challans | Vendor Bills" in the
@@ -270,65 +290,55 @@ def navigate_to_indent_completed(page: Page) -> bool:
               using a JS DOM walk that anchors on the INDENTS heading.
     """
     # ── Step 1: sidebar navigation ───────────────────────────────────────────
-    sidebar_clicked = False
-    for sel in _PURCHASE_SIDEBAR_SELECTORS:
-        try:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                loc.click(timeout=10_000)
-                page.wait_for_load_state("networkidle", timeout=30_000)
-                page.wait_for_timeout(3000)
-                print(f"[collector] Sidebar clicked via: {sel!r}")
-                sidebar_clicked = True
-                break
-        except Exception:
-            continue
-
-    if not sidebar_clicked:
+    loc, sel_used = first_match(ctx, purchase_selectors)
+    if loc is None:
         print(
             "[collector] WARNING: Could not click sidebar 'Purchase' section. "
             "If running --headful, please navigate manually."
         )
         return False
 
+    try:
+        loc.first.click(timeout=10_000)
+    except Exception as e:
+        print(f"[collector] Purchase click failed ({sel_used!r}): {e}")
+        return False
+
+    gwt_soft_wait_after_action(ctx)
+    print(f"[collector] Sidebar clicked via: {sel_used!r}")
+
     # ── Step 2: click COMPLETED under INDENTS ────────────────────────────────
     # Strategy A: JavaScript DOM walk anchored on INDENTS heading
     try:
-        raw = page.evaluate(_INDENT_COMPLETED_JS)
+        raw = ctx.evaluate(_INDENT_COMPLETED_JS)
         result = json.loads(raw) if isinstance(raw, str) else raw
         if result.get("ok"):
-            page.wait_for_load_state("networkidle", timeout=30_000)
-            page.wait_for_timeout(3000)
+            gwt_soft_wait_after_action(ctx)
             print(
                 f"[collector] COMPLETED clicked via JS: {result.get('text', '')} "
                 f"(strategy={result.get('strategy', '')})"
             )
-            if _ensure_indent_completed_list(page):
+            if _ensure_indent_completed_list(ctx):
                 return True
         print(f"[collector] JS navigation: {result.get('error', 'unknown')}")
     except Exception as e:
         print(f"[collector] JS navigation failed: {e}")
 
     # Strategy B: explicitly click INDENTS → COMPLETED in the left section card.
-    for sel in [
-        "div:has-text('INDENTS') >> text=/COMPLETED\\s*\\|\\s*\\d+/",
-        "div:has-text('INDENTS') >> text=COMPLETED",
-        "text=INDENTS >> xpath=ancestor::*[1] >> text=COMPLETED",
-    ]:
+    for sel in completed_fallback_selectors:
         try:
-            loc = page.locator(sel).first
-            if loc.count() > 0:
-                loc.click(timeout=10_000)
-                page.wait_for_load_state("networkidle", timeout=30_000)
-                page.wait_for_timeout(3000)
+            cloc = ctx.locator(sel).first
+            if cloc.count() > 0:
+                cloc.click(timeout=10_000)
+                gwt_soft_wait_after_action(ctx)
                 print(f"[collector] COMPLETED clicked via fallback: {sel!r}")
-                if _ensure_indent_completed_list(page):
+                if _ensure_indent_completed_list(ctx):
                     return True
         except Exception:
             continue
 
     # Strategy C: If section click worked but list did not switch, force filters.
-    if _force_indent_completed_filters(page):
+    if _force_indent_completed_filters(ctx):
         return True
 
     print(
@@ -340,7 +350,7 @@ def navigate_to_indent_completed(page: Page) -> bool:
 
 # ── Scroll & click helpers for indent list ────────────────────────────────────
 
-def _ensure_indent_completed_list(page: Page) -> bool:
+def _ensure_indent_completed_list(ctx: Union[Page, Frame]) -> bool:
     """Verify list view has Indents + Completed filters selected."""
     checks = [
         "text=/INDENT NO\\./i",
@@ -350,22 +360,22 @@ def _ensure_indent_completed_list(page: Page) -> bool:
     for _ in range(10):
         for sel in checks:
             try:
-                if page.locator(sel).first.count() > 0:
+                if ctx.locator(sel).first.count() > 0:
                     return True
             except Exception:
                 continue
-        page.wait_for_timeout(500)
+        ctx.wait_for_timeout(500)
     return False
 
 
-def _force_indent_completed_filters(page: Page) -> bool:
+def _force_indent_completed_filters(ctx: Union[Page, Frame]) -> bool:
     """Set top filter dropdowns to Indents + Completed (UI-only fallback)."""
     try:
         for sel in [
             "select:near(:text('Search Indent Number here')) >> nth=0",
             "select >> nth=0",
         ]:
-            dd = page.locator(sel).first
+            dd = ctx.locator(sel).first
             if dd.count() == 0:
                 continue
             try:
@@ -382,7 +392,7 @@ def _force_indent_completed_filters(page: Page) -> bool:
             "select:near(:text('Search Indent Number here')) >> nth=1",
             "select >> nth=1",
         ]:
-            dd = page.locator(sel).first
+            dd = ctx.locator(sel).first
             if dd.count() == 0:
                 continue
             try:
@@ -395,11 +405,10 @@ def _force_indent_completed_filters(page: Page) -> bool:
                 except Exception:
                     continue
 
-        page.wait_for_load_state("networkidle", timeout=15_000)
-        page.wait_for_timeout(2000)
+        gwt_soft_wait_after_action(ctx, settle_ms=2000)
     except Exception:
         return False
-    return _ensure_indent_completed_list(page)
+    return _ensure_indent_completed_list(ctx)
 
 def _build_list_scroll_js(delta_y: int = 800) -> str:
     """Return JS that scrolls the widest scrollable container by delta_y px."""
@@ -425,7 +434,7 @@ def _build_list_scroll_js(delta_y: int = 800) -> str:
 
 
 def _scroll_indent_list(
-    page: Page,
+    ctx: Union[Page, Frame],
     seq: Dict[str, int],
     *,
     max_rounds: int = 30,
@@ -457,21 +466,22 @@ def _scroll_indent_list(
     prev_n = seq["n"]
     idle_count = 0
     last_rpc_n = seq["n"]
+    pw = owning_page(ctx)
 
     for round_num in range(max_rounds):
         try:
-            panel = page.evaluate(scroll_js)
+            panel = ctx.evaluate(scroll_js)
             if round_num == 0:
                 print(f"[collector] Scrolling list panel: {panel}")
             if round_num % 3 == 2:
-                scrolled = page.evaluate(scroll_all_js)
+                scrolled = ctx.evaluate(scroll_all_js)
                 if scrolled:
                     print(f"[collector] Broad-scroll pass touched {scrolled} container(s)")
         except Exception:
-            page.mouse.move(800, 450)
-            page.mouse.wheel(0, scroll_delta)
+            pw.mouse.move(800, 450)
+            pw.mouse.wheel(0, scroll_delta)
 
-        page.wait_for_timeout(1500)
+        ctx.wait_for_timeout(1500)
 
         if seq["n"] == last_rpc_n:
             idle_count += 1
@@ -513,30 +523,31 @@ _CLOSE_POPUP_JS = """
 """
 
 
-def _close_detail_popup(page: Page) -> bool:
+def _close_detail_popup(ctx: Union[Page, Frame]) -> bool:
     """Close the indent detail popup using JS, Escape, or click-away."""
+    pw = owning_page(ctx)
     for attempt in [
-        lambda: _try_js_close(page),
-        lambda: page.keyboard.press("Escape"),
-        lambda: page.mouse.click(5, 5),
+        lambda: _try_js_close(ctx),
+        lambda: pw.keyboard.press("Escape"),
+        lambda: pw.mouse.click(5, 5),
     ]:
         try:
             attempt()
-            page.wait_for_timeout(1000)
+            ctx.wait_for_timeout(1000)
             return True
         except Exception:
             continue
     return False
 
 
-def _try_js_close(page: Page) -> None:
-    result = page.evaluate(_CLOSE_POPUP_JS)
+def _try_js_close(ctx: Union[Page, Frame]) -> None:
+    result = ctx.evaluate(_CLOSE_POPUP_JS)
     if not (isinstance(result, str) and result.startswith("closed")):
         raise RuntimeError(result)
 
 
 def _click_indent_rows(
-    page: Page,
+    ctx: Union[Page, Frame],
     seq: Dict[str, int],
     *,
     max_clicks: int = 5,
@@ -546,15 +557,21 @@ def _click_indent_rows(
 
     Returns the number of detail responses captured.
     """
-    card_candidates = [
+    # :has-text() only accepts a plain substring in CSS; regex belongs in .filter(has_text=re.compile(...)).
+    card_candidates: List[Union[str, Callable[[Union[Page, Frame]], Locator]]] = [
         "div:has-text('INDENT NO.')",
         "div:has-text('Indent No.')",
         "div:has-text('INDENT STATUS')",
+        lambda c: c.locator("div").filter(has_text=re.compile(r"INDENT\s*NO\.?", re.I)),
+        lambda c: c.locator("tr").filter(has_text=re.compile(r"Ind-\d+", re.I)),
+        lambda c: c.locator("table >> tr").filter(
+            has_text=re.compile(r"J-[A-Z0-9-]+-Ind-", re.I)
+        ),
     ]
-    row_cards = None
+    row_cards: Optional[Locator] = None
     count = 0
-    for sel in card_candidates:
-        loc = page.locator(sel)
+    for item in card_candidates:
+        loc = item(ctx) if callable(item) else ctx.locator(item)
         c = loc.count()
         if c > count:
             row_cards = loc
@@ -590,12 +607,12 @@ def _click_indent_rows(
 
         captured = False
         for _ in range(detail_wait_seconds * 2):
-            page.wait_for_timeout(500)
+            ctx.wait_for_timeout(500)
             if seq.get("detail_n", seq["n"]) > prev_n:
                 captured = True
                 break
             try:
-                if page.locator("text=/Indent\\s*\\(Completed\\)/i").first.count() > 0:
+                if ctx.locator("text=/Indent\\s*\\(Completed\\)/i").first.count() > 0:
                     captured = True
                     break
             except Exception:
@@ -607,8 +624,8 @@ def _click_indent_rows(
         else:
             print(f"  [click] indent {i + 1}: no detail response (timeout)")
 
-        _close_detail_popup(page)
-        page.wait_for_timeout(1000)
+        _close_detail_popup(ctx)
+        ctx.wait_for_timeout(1000)
 
     print(
         f"[collector] Clicked {min(count, max_clicks)} indents, "
@@ -629,6 +646,10 @@ def run_collection(
     auto_paginate: bool = True,
     page_size: int = 100,
     max_detail_clicks: int = 5,
+    *,
+    snapshot_ui: bool = False,
+    snapshot_ui_manual: bool = False,
+    snapshot_ui_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Phase 1 – Playwright: login, navigate, scroll list, click indents for details.
@@ -636,6 +657,8 @@ def run_collection(
 
     Returns the combined payload catalog.
     """
+    snap_login = snapshot_ui or snapshot_ui_only
+
     output_dir.mkdir(parents=True, exist_ok=True)
     payloads_dir = output_dir / "payloads"
     dumps_dir = output_dir / "dumps"
@@ -647,19 +670,50 @@ def run_collection(
     seq = {"n": 0, "detail_n": 0, "list_n": 0}
     captured_headers: Dict[str, Dict[str, str]] = {}
     captured_permutation2: Dict[str, str] = {"value": ""}
+    _audit_erp_post_saved = False
+    _http_audit = os.environ.get("INDENT_HTTP_AUDIT", "").strip() in (
+        "1",
+        "true",
+        "yes",
+    )
 
     def on_response(response) -> None:
+        nonlocal _audit_erp_post_saved
         try:
             req = response.request
             if req.method != "POST":
                 return
             url = req.url
-            if "deptherp/erp" not in url:
+            if "deptherp" not in url:
                 return
             pd = req.post_data
+            if _http_audit and pd and "/deptherp/erp" in url:
+                with (logs_dir / "http_audit.log").open("a", encoding="utf-8") as af:
+                    pl = (pd or "").lower()
+                    af.write(
+                        f"{time.time()}: status={response.status} "
+                        f"pd_len={len(pd or '')} "
+                        f"list={_LIST_METHOD.lower() in pl} "
+                        f"detail={_DETAIL_METHOD.lower() in pl} "
+                        f"{url[:160]}\n"
+                    )
+                if (
+                    "/deptherp/erp" in url
+                    and "remote_logging" not in url
+                    and not _audit_erp_post_saved
+                ):
+                    (logs_dir / "sample_erp_post.txt").write_text(
+                        (pd or "")[:8000], encoding="utf-8"
+                    )
+                    _audit_erp_post_saved = True
+            if "/deptherp/erp" not in url:
+                return
             if not pd:
                 return
-            if _LIST_METHOD not in pd and _DETAIL_METHOD not in pd:
+            pl = pd.lower()
+            list_hit = _LIST_METHOD.lower() in pl
+            detail_hit = _DETAIL_METHOD.lower() in pl
+            if not list_hit and not detail_hit:
                 return
             if response.status != 200:
                 return
@@ -676,7 +730,8 @@ def run_collection(
         payload_path.write_text(pd, encoding="utf-8")
         dump_path.write_text(body, encoding="utf-8")
 
-        is_detail = _DETAIL_METHOD in pd
+        pl = pd.lower()
+        is_detail = _DETAIL_METHOD.lower() in pl
         method_name = _DETAIL_METHOD if is_detail else _LIST_METHOD
         indent_id = parse_indent_id_from_detail_payload(pd) if is_detail else None
         erp_url = detect_erp_url(pd, url)
@@ -707,26 +762,79 @@ def run_collection(
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=not headful)
         context = browser.new_context(viewport={"width": 1600, "height": 900})
+        # GWT XHR often originates from iframes; Page-level listeners miss those.
+        context.on("response", on_response)
         page = context.new_page()
-        page.on("response", on_response)
 
         login_and_wait(page, base_url, user, password)
-        nav_ok = navigate_to_indent_completed(page)
+
+        shell = wait_for_post_login_shell(page)
+        if shell is not None:
+            print("[collector] Post-login shell ready.")
+            ctx: Union[Page, Frame] = shell
+        else:
+            print(
+                "[collector] WARNING: Post-login shell not detected within timeout; "
+                "snapshots and navigation may still see login DOM only."
+            )
+            ctx = get_indent_ui_context(page)
+        page.wait_for_timeout(1500)
+
+        sel_cfg = load_indent_selectors_config(output_dir)
+        purchase_selectors = merge_purchase_selectors(PURCHASE_NAV_SELECTORS, sel_cfg)
+        completed_selectors = merge_completed_selectors(
+            COMPLETED_FALLBACK_SELECTORS, sel_cfg
+        )
+
+        if snap_login:
+            save_selector_snapshot(ctx, output_dir, "login", all_probe_selectors())
+            print(
+                f"[collector] UI snapshot (login) → "
+                f"{output_dir}/selector_probe_login.json"
+            )
+
+        if snapshot_ui_manual:
+            print(
+                f"[collector] Manual navigation window: {wait_seconds}s, "
+                "then post_nav snapshot..."
+            )
+            page.wait_for_timeout(wait_seconds * 1000)
+            ctx = get_indent_ui_context(page)
+            save_selector_snapshot(ctx, output_dir, "post_nav", all_probe_selectors())
+            print(
+                f"[collector] UI snapshot (post_nav) → "
+                f"{output_dir}/selector_probe_post_nav.json"
+            )
+
+        if snapshot_ui_only:
+            nav_ok = False
+        else:
+            nav_ok = navigate_to_indent_completed(
+                ctx, purchase_selectors, completed_selectors
+            )
 
         if nav_ok:
+            ctx = get_indent_ui_context(page)
+            try:
+                ctx.locator("text=/INDENT NO\\./i").first.wait_for(
+                    state="visible", timeout=45_000
+                )
+            except Exception:
+                pass
             print("[collector] Scrolling indent list for lazy loading...")
-            _scroll_indent_list(page, seq, max_rounds=30, idle_threshold=5)
+            _scroll_indent_list(ctx, seq, max_rounds=30, idle_threshold=5)
 
             print("[collector] Clicking indent rows for detail capture...")
             _click_indent_rows(
-                page, seq, max_clicks=max_detail_clicks, detail_wait_seconds=15,
+                ctx, seq, max_clicks=max_detail_clicks, detail_wait_seconds=15,
             )
         else:
-            print(
-                f"[collector] Navigation failed. Waiting {wait_seconds}s "
-                "for manual interaction..."
-            )
-            page.wait_for_timeout(wait_seconds * 1000)
+            if not snapshot_ui_only:
+                print(
+                    f"[collector] Navigation failed. Waiting {wait_seconds}s "
+                    "for manual interaction..."
+                )
+                page.wait_for_timeout(wait_seconds * 1000)
 
         auth_path = output_dir / "auth_state.json"
         context.storage_state(path=str(auth_path))
@@ -1030,6 +1138,21 @@ def parse_args() -> argparse.Namespace:
         metavar="HASH",
         help="ERPService2 permutation hash for building detail payloads",
     )
+    p.add_argument(
+        "--snapshot-ui",
+        action="store_true",
+        help="After login, save snapshot_login.html + css_classes + selector_probe",
+    )
+    p.add_argument(
+        "--snapshot-ui-manual",
+        action="store_true",
+        help="After login snapshot, wait --wait seconds then save post_nav probe",
+    )
+    p.add_argument(
+        "--snapshot-ui-only",
+        action="store_true",
+        help="Snapshot(s) then skip automated navigation (still saves auth_state.json)",
+    )
     return p.parse_args()
 
 
@@ -1067,6 +1190,9 @@ def main() -> None:
         wait_seconds=args.wait,
         auto_paginate=not args.no_paginate,
         page_size=args.page_size,
+        snapshot_ui=args.snapshot_ui,
+        snapshot_ui_manual=args.snapshot_ui_manual,
+        snapshot_ui_only=args.snapshot_ui_only,
     )
 
 

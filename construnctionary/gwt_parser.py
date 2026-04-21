@@ -105,8 +105,12 @@ def normalize_gwt_response(text: str) -> List[Any]:
         t = t[4:].strip()
     # GWT splits large responses as [a,b,...].concat([c,d,...]) — collapse first
     t = _collapse_concat_arrays(t)
-    # json5 handles single-quoted strings and trailing commas common in GWT
-    return json5.loads(t)
+    # Fast path: many dumps are strict JSON after concat collapse.
+    try:
+        return json.loads(t)
+    except json.JSONDecodeError:
+        # json5 handles single-quoted strings and trailing commas common in GWT
+        return json5.loads(t)
 
 
 # ---------------------------------------------------------------------------
